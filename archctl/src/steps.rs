@@ -27,11 +27,6 @@ impl Step {
                 category: Category::Upgrade,
             },
             Step {
-                name: "Flatpak update",
-                description: "Update Flatpak packages if flatpak is installed",
-                category: Category::Upgrade,
-            },
-            Step {
                 name: "Pacnew/pacsave check",
                 description: "Find configuration files requiring review",
                 category: Category::Maintenance,

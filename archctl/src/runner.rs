@@ -11,14 +11,13 @@ fn fallback_step_lines(name: &str) -> Option<(usize, usize)> {
     match name {
         "Pre-flight checks" => Some((170, 210)),
         "System upgrade" => Some((215, 224)),
-        "Flatpak update" => Some((226, 231)),
-        "Pacnew/pacsave check" => Some((236, 259)),
-        "Orphaned packages" => Some((261, 280)),
-        "Pacman cache cleanup" => Some((282, 298)),
-        "Trash cleanup" => Some((300, 301)),
-        "Broken symlinks" => Some((303, 304)),
-        "Failed systemd services" => Some((306, 316)),
-        "Reboot detection" => Some((318, 368)),
+        "Pacnew/pacsave check" => Some((229, 252)),
+        "Orphaned packages" => Some((254, 273)),
+        "Pacman cache cleanup" => Some((275, 291)),
+        "Trash cleanup" => Some((293, 294)),
+        "Broken symlinks" => Some((296, 297)),
+        "Failed systemd services" => Some((299, 309)),
+        "Reboot detection" => Some((311, 361)),
         _ => None,
     }
 }
@@ -29,7 +28,6 @@ fn get_step_lines(lines: &[&str], name: &str) -> Option<(usize, usize)> {
     let marker_list = [
         ("Pre-flight checks", "# 1. Determine package manager"),
         ("System upgrade", "section \"Package Upgrade\""),
-        ("Flatpak update", "# Optional: Update Flatpak if installed"),
         ("Pacnew/pacsave check", "# 1. Check for .pacnew and .pacsave files"),
         ("Orphaned packages", "# 2. Check for orphaned packages"),
         ("Pacman cache cleanup", "# 3. Pacman cache maintenance"),
@@ -44,16 +42,16 @@ fn get_step_lines(lines: &[&str], name: &str) -> Option<(usize, usize)> {
 
     let start_line = lines.iter().position(|line| line.contains(target_marker))?;
 
-    let end_line = if target_idx + 1 < marker_list.len() {
-        let next_marker = marker_list[target_idx + 1].1;
-        if let Some(next_pos) = lines.iter().position(|line| line.contains(next_marker)) {
-            next_pos
-        } else {
-            lines.len()
-        }
+    // The upgrade step ends where post-upgrade maintenance begins, before the
+    // next selectable step's marker.
+    let end_marker = if name == "System upgrade" {
+        Some("# Post-Upgrade Maintenance")
     } else {
-        lines.len()
+        marker_list.get(target_idx + 1).map(|(_, marker)| *marker)
     };
+    let end_line = end_marker
+        .and_then(|marker| lines.iter().position(|line| line.contains(marker)))
+        .unwrap_or(lines.len());
 
     if start_line < end_line {
         let mut actual_start = start_line;

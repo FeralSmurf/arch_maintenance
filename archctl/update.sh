@@ -124,7 +124,7 @@ check_broken_symlinks() {
     local search_dir="$HOME"
     local broken_links=()
 
-    # Search for broken symlinks while pruning cache, trash, and runtime containers (Steam, Flatpak, Wine)
+    # Search for broken symlinks while pruning cache, trash, and runtime containers (Steam, Wine)
     while IFS= read -r link; do
         [[ -n "$link" ]] && broken_links+=("$link")
     done < <(find "$search_dir" -xdev \
@@ -134,7 +134,6 @@ check_broken_symlinks() {
         -o -path "$search_dir/.steam" \
         -o -path "$search_dir/.wine" \
         -o -path "$search_dir/.var" \
-        -o -path "$search_dir/.local/share/flatpak" \
         -o -path "*/.mozilla/*" \
         -o -path "*/.thunderbird/*" \) -prune \
         -o -xtype l -print 2>/dev/null || true)
@@ -222,13 +221,6 @@ if ! $HELPER -Syu "$@"; then
 fi
 echo
 success "System packages updated successfully."
-
-# Optional: Update Flatpak if installed
-if command -v flatpak >/dev/null 2>&1; then
-    echo
-    step "Updating Flatpak packages..."
-    flatpak update -y || warn "Flatpak update finished with warnings."
-fi
 
 # ------------------------------------------------------------------------------
 # Post-Upgrade Maintenance
