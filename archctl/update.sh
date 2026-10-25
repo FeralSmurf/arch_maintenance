@@ -146,6 +146,7 @@ check_broken_symlinks() {
             echo -e "    ${B_YELLOW}•${RESET} ${link} ${DIM}➜ ${target}${RESET}"
         done
         echo
+        echo -e "    ${DIM}Note: some broken symlinks are intentional; review the list before deleting.${RESET}"
         read -r -p "Delete these broken symlinks? [y/N]: " clean_syms
         if [[ "${clean_syms:-}" =~ ^[Yy]$ ]]; then
             local count=0
@@ -275,7 +276,7 @@ fi
 if command -v paccache >/dev/null 2>&1; then
     echo
     step "Checking pacman cache size..."
-    CACHE_CANDIDATES=$(paccache -d 2>/dev/null | grep -E "candidates" || true)
+    CACHE_CANDIDATES=$(paccache -d -k2 2>/dev/null | grep -E "candidates" || true)
     if [[ -n "$CACHE_CANDIDATES" ]]; then
         info "$CACHE_CANDIDATES"
         read -r -p "Clean package cache (keep last 2 versions)? [y/N]: " clean_cache
@@ -298,13 +299,26 @@ check_broken_symlinks
 # 6. Failed systemd services check
 echo
 step "Checking systemd service health..."
+FAILED_ANY=0
 FAILED_SERVICES=$(systemctl --failed --no-legend --plain 2>/dev/null || true)
 if [[ -n "$FAILED_SERVICES" ]]; then
-    warn "Detected failed systemd service(s):"
+    FAILED_ANY=1
+    warn "Detected failed system service(s):"
     echo "$FAILED_SERVICES" | sed 's/^/    /'
-    echo -e "    ${DIM}Hint: Inspect with 'systemctl status <service>' or 'journalctl -xe'${RESET}"
-else
+fi
+FAILED_USER_SERVICES=""
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    FAILED_USER_SERVICES=$(systemctl --user --failed --no-legend --plain 2>/dev/null || true)
+fi
+if [[ -n "$FAILED_USER_SERVICES" ]]; then
+    FAILED_ANY=1
+    warn "Detected failed user service(s):"
+    echo "$FAILED_USER_SERVICES" | sed 's/^/    /'
+fi
+if [[ $FAILED_ANY -eq 0 ]]; then
     success "All systemd units are running normally."
+else
+    echo -e "    ${DIM}Hint: Inspect with 'systemctl status <service>' or 'journalctl -xe'${RESET}"
 fi
 
 # ------------------------------------------------------------------------------
@@ -322,13 +336,42 @@ if [[ -d "/usr/lib/modules" && ! -d "/usr/lib/modules/${RUNNING_KERNEL}" ]]; the
     REBOOT_REASONS+=("Running kernel (${RUNNING_KERNEL}) was replaced by a newer kernel")
 fi
 
-# Check B: Core packages upgraded in this transaction
-REBOOT_REGEX='^(linux|linux-lts|linux-zen|linux-hardened|linux-rt|linux-cachyos|linux-firmware|systemd|systemd-libs|systemd-sysvcompat|udev|amd-ucode|intel-ucode|glibc|nvidia|nvidia-dkms|nvidia-open|nvidia-open-dkms|cryptsetup)$'
+# Check B: Packages that require a reboot, upgraded since the last boot.
+# Kernel packages are matched against the running kernel's pkgbase, so upgrading
+# "linux" while booted into "linux-lts" no longer flags a reboot.
+RUNNING_PKGBASE=$(cat "/usr/lib/modules/${RUNNING_KERNEL}/pkgbase" 2>/dev/null || true)
+[[ -z "$RUNNING_PKGBASE" ]] && RUNNING_PKGBASE="linux"
+REBOOT_REGEX="^(${RUNNING_PKGBASE}|systemd|systemd-libs|systemd-sysvcompat|udev|glibc|linux-firmware|amd-ucode|intel-ucode|nvidia|nvidia-dkms|nvidia-open|nvidia-open-dkms|cryptsetup)$"
+
+# Scan since boot so this step works on its own. Fall back to the line offset
+# recorded by the pre-flight step when the boot time is unavailable.
+BOOT_EPOCH=0
+BOOT_TIME=$(uptime -s 2>/dev/null || true)
+if [[ -n "$BOOT_TIME" ]]; then
+    BOOT_EPOCH=$(date -d "$BOOT_TIME" +%s 2>/dev/null || echo 0)
+fi
 
 if [[ -f "$PACMAN_LOG" ]]; then
-    RECENT_LOGS=$(tail -n +"$((LOG_START_LINE + 1))" "$PACMAN_LOG" 2>/dev/null || true)
-    if [[ -n "$RECENT_LOGS" ]]; then
-        UPGRADED_CRITICAL=$(echo "$RECENT_LOGS" | grep -E '\[ALPM\] (upgraded|installed) ' | sed -E 's/.*\[ALPM\] (upgraded|installed) ([^ ]+) .*/\2/' | grep -E "$REBOOT_REGEX" | sort -u || true)
+    if [[ "$BOOT_EPOCH" -gt 0 ]]; then
+        PACMAN_SLICE=$(grep -E '\[ALPM\] (upgraded|installed) ' "$PACMAN_LOG" 2>/dev/null | tail -n 2000 || true)
+    else
+        PACMAN_SLICE=$(tail -n +"$(( ${LOG_START_LINE:-0} + 1 ))" "$PACMAN_LOG" 2>/dev/null | grep -E '\[ALPM\] (upgraded|installed) ' || true)
+    fi
+
+    if [[ -n "$PACMAN_SLICE" ]]; then
+        UPGRADED_CRITICAL=$(
+            while IFS= read -r entry; do
+                pkg=$(sed -E 's/.*\[ALPM\] (upgraded|installed) ([^ ]+) .*/\2/' <<< "$entry")
+                [[ "$pkg" =~ $REBOOT_REGEX ]] || continue
+                if [[ "$BOOT_EPOCH" -gt 0 ]]; then
+                    entry_ts=${entry%%]*}
+                    entry_ts=${entry_ts#[}
+                    entry_epoch=$(date -d "$entry_ts" +%s 2>/dev/null || echo 0)
+                    [[ "$entry_epoch" -gt 0 && "$entry_epoch" -lt "$BOOT_EPOCH" ]] && continue
+                fi
+                echo "$pkg"
+            done <<< "$PACMAN_SLICE" | sort -u
+        )
         if [[ -n "$UPGRADED_CRITICAL" ]]; then
             REBOOT_NEEDED=1
             while IFS= read -r pkg; do

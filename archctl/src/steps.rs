@@ -63,4 +63,19 @@ impl Step {
             },
         ]
     }
+
+    /// Steps that delete or replace user data.
+    pub fn is_destructive(&self) -> bool {
+        matches!(
+            self.name,
+            "Orphaned packages" | "Pacman cache cleanup" | "Trash cleanup" | "Broken symlinks"
+        )
+    }
+
+    /// Steps that touch the pacman database. These must not run after a failed
+    /// upgrade, which would leave the system in a partial-upgrade state.
+    pub fn mutates_packages(&self) -> bool {
+        self.category == Category::Upgrade
+            || matches!(self.name, "Orphaned packages" | "Pacman cache cleanup")
+    }
 }

@@ -53,8 +53,32 @@ fn find_update_script() -> Option<String> {
     None
 }
 
+/// AUR helpers refuse to run as root, and the user-scoped cleanup steps (trash,
+/// broken symlinks) would silently target /root instead of the invoking user.
+fn running_as_root() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find(|line| line.starts_with("Uid:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|uid| uid.parse::<u32>().ok())
+        })
+        .map(|uid| uid == 0)
+        .unwrap_or(false)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if running_as_root() {
+        anyhow::bail!(
+            "archctl must not run as root: AUR helpers refuse to run as root and the \
+             user-scoped steps would target /root.\nRun it as your normal user; it uses \
+             sudo for the privileged commands."
+        );
+    }
 
     let script_path = if cli.script != "update.sh" {
         cli.script

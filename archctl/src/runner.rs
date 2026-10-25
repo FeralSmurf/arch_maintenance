@@ -1,70 +1,120 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::steps::Step;
 
-/// Fallback line ranges in update.sh (1-indexed, inclusive) for each step.
-fn fallback_step_lines(name: &str) -> Option<(usize, usize)> {
-    match name {
-        "Pre-flight checks" => Some((170, 210)),
-        "System upgrade" => Some((215, 224)),
-        "Pacnew/pacsave check" => Some((229, 252)),
-        "Orphaned packages" => Some((254, 273)),
-        "Pacman cache cleanup" => Some((275, 291)),
-        "Trash cleanup" => Some((293, 294)),
-        "Broken symlinks" => Some((296, 297)),
-        "Failed systemd services" => Some((299, 309)),
-        "Reboot detection" => Some((311, 361)),
-        _ => None,
-    }
-}
+/// Marker that starts each step's block in update.sh. Steps run from their
+/// marker up to the next step's marker (`# Post-Upgrade Maintenance` for the
+/// upgrade). Both are comments or section headers, so a step is always a
+/// complete, runnable slice of the script.
+const STEP_MARKERS: [(&str, &str); 9] = [
+    ("Pre-flight checks", "# Pre-flight Checks"),
+    ("System upgrade", "section \"Package Upgrade\""),
+    ("Pacnew/pacsave check", "# Post-Upgrade Maintenance"),
+    ("Orphaned packages", "# 2. Check for orphaned packages"),
+    ("Pacman cache cleanup", "# 3. Pacman cache maintenance"),
+    ("Trash cleanup", "# 4. Empty user trash"),
+    ("Broken symlinks", "# 5. Check for broken symbolic links"),
+    ("Failed systemd services", "# 6. Failed systemd services check"),
+    ("Reboot detection", "section \"Reboot Status\""),
+];
 
-/// Find step line ranges dynamically based on markers in the script,
-/// falling back to predefined line ranges if markers cannot be found.
-fn get_step_lines(lines: &[&str], name: &str) -> Option<(usize, usize)> {
-    let marker_list = [
-        ("Pre-flight checks", "# 1. Determine package manager"),
-        ("System upgrade", "section \"Package Upgrade\""),
-        ("Pacnew/pacsave check", "# 1. Check for .pacnew and .pacsave files"),
-        ("Orphaned packages", "# 2. Check for orphaned packages"),
-        ("Pacman cache cleanup", "# 3. Pacman cache maintenance"),
-        ("Trash cleanup", "# 4. Empty user trash"),
-        ("Broken symlinks", "# 5. Check for broken symbolic links"),
-        ("Failed systemd services", "# 6. Failed systemd services check"),
-        ("Reboot detection", "section \"Reboot Status\""),
-    ];
+/// Locate a step's line range (1-indexed, inclusive) in update.sh.
+///
+/// A missing marker is an error: silently emitting an empty step would make
+/// the TUI report success for maintenance that never ran.
+fn step_lines(lines: &[&str], name: &str) -> Result<(usize, usize)> {
+    let index = STEP_MARKERS
+        .iter()
+        .position(|(step, _)| *step == name)
+        .with_context(|| format!("unknown step '{}'", name))?;
+    let marker = STEP_MARKERS[index].1;
 
-    let target_idx = marker_list.iter().position(|(n, _)| *n == name)?;
-    let target_marker = marker_list[target_idx].1;
+    let start = lines
+        .iter()
+        .position(|line| line.contains(marker))
+        .with_context(|| format!("marker '{}' for step '{}' not found", marker, name))?;
 
-    let start_line = lines.iter().position(|line| line.contains(target_marker))?;
-
-    // The upgrade step ends where post-upgrade maintenance begins, before the
-    // next selectable step's marker.
     let end_marker = if name == "System upgrade" {
         Some("# Post-Upgrade Maintenance")
     } else {
-        marker_list.get(target_idx + 1).map(|(_, marker)| *marker)
+        STEP_MARKERS.get(index + 1).map(|(_, marker)| *marker)
     };
-    let end_line = end_marker
+    let end = end_marker
         .and_then(|marker| lines.iter().position(|line| line.contains(marker)))
         .unwrap_or(lines.len());
 
-    if start_line < end_line {
-        let mut actual_start = start_line;
-        if (name == "Pre-flight checks" && actual_start >= 2 && lines[actual_start - 2].contains("banner"))
-            || (name == "Pacnew/pacsave check"
-                && actual_start >= 2
-                && lines[actual_start - 2].contains("Maintenance & Diagnostics"))
-        {
-            actual_start -= 2;
+    if start >= end {
+        anyhow::bail!(
+            "step '{}' has an empty range in update.sh (marker at line {}, next marker at line {})",
+            name,
+            start + 1,
+            end + 1
+        );
+    }
+
+    Ok((start + 1, end))
+}
+
+/// A generated script plus the file its per-step trailers are written to.
+pub struct Prepared {
+    script: tempfile::NamedTempFile,
+    status: tempfile::NamedTempFile,
+}
+
+pub struct RunOutcome {
+    pub status: ExitStatus,
+    pub ran: Vec<String>,
+    pub duration: Duration,
+}
+
+impl Prepared {
+    #[cfg(test)]
+    pub fn script_path(&self) -> &std::path::Path {
+        self.script.path()
+    }
+
+    pub fn script_text(&self) -> Result<String> {
+        fs::read_to_string(self.script.path())
+            .with_context(|| format!("Failed to read {}", self.script.path().display()))
+    }
+
+    /// Run the script interactively, inheriting the terminal so sudo, pacman
+    /// and AUR helper prompts work normally.
+    pub fn run(&self, auto_confirm: Option<bool>) -> Result<RunOutcome> {
+        let mut cmd = Command::new("bash");
+        cmd.arg(self.script.path());
+
+        // If auto_confirm is Some(true), pass --noconfirm for pacman/yay
+        if auto_confirm == Some(true) {
+            cmd.arg("--noconfirm");
         }
-        Some((actual_start + 1, end_line))
-    } else {
-        fallback_step_lines(name)
+
+        cmd.env("ARCHCTL_STATUS_FILE", self.status.path());
+        cmd.stdin(Stdio::inherit());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+
+        let started = Instant::now();
+        let status = cmd
+            .status()
+            .with_context(|| format!("Failed to execute script at {}", self.script.path().display()))?;
+        let duration = started.elapsed();
+
+        let ran = fs::read_to_string(self.status.path())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix("ran "))
+            .map(str::to_string)
+            .collect();
+
+        Ok(RunOutcome {
+            status,
+            ran,
+            duration,
+        })
     }
 }
 
@@ -75,28 +125,31 @@ pub fn generate_script(
     update_script: &str,
     selected: &[&Step],
     auto_confirm: Option<bool>,
-) -> Result<PathBuf> {
+) -> Result<Prepared> {
     let content = fs::read_to_string(update_script)
         .with_context(|| format!("Failed to read {}", update_script))?;
     let lines: Vec<&str> = content.lines().collect();
 
-    let mut script = String::new();
-
-    // 1. Header: shebang, colors, and utility function definitions from update.sh
+    // Everything up to the pre-flight marker is the shared prologue: shebang,
+    // colours and helper functions.
     let header_end = lines
         .iter()
-        .position(|l| l.contains("# Pre-flight Checks") || l.contains("# 1. Determine package manager"))
-        .unwrap_or_else(|| 166.min(lines.len()));
+        .position(|line| line.contains(STEP_MARKERS[0].1))
+        .context("Could not find the pre-flight section in update.sh")?;
 
+    let mut script = String::new();
     for line in &lines[..header_end] {
         script.push_str(line);
         script.push('\n');
     }
     script.push('\n');
 
-    // 2. Safe variable initialization defaults (avoids bash set -u unbound variable crashes)
-    script.push_str(r#"
+    // Safe variable initialization defaults (avoids bash set -u unbound
+    // variable crashes when the pre-flight step is not selected).
+    script.push_str(
+        r#"
 # --- archctl environment initialization ---
+ARCHCTL_STATUS_FILE="${ARCHCTL_STATUS_FILE:-/dev/null}"
 HELPER=""
 if command -v yay >/dev/null 2>&1; then
     HELPER="yay"
@@ -111,22 +164,75 @@ if [[ -f "$PACMAN_LOG" ]]; then
     LOG_START_LINE=$(wc -l < "$PACMAN_LOG" 2>/dev/null || echo 0)
 fi
 PACMAN_DB_LCK="/var/lib/pacman/db.lck"
-"#);
+"#,
+    );
 
-    // 3. Auto-confirmation overrides if configured
     if let Some(confirm) = auto_confirm {
-        let answer = if confirm { "y" } else { "n" };
-        let msg = if confirm { "auto-confirmed (yes)" } else { "auto-declined (no)" };
+        script.push_str(&auto_confirm_override(confirm));
+    }
+
+    for step in selected {
+        let (start, end) = step_lines(&lines, step.name)?;
+        script.push_str(&format!("\n# === {} ===\n", step.name));
+        for line in &lines[start - 1..end] {
+            script.push_str(line);
+            script.push('\n');
+        }
+        // Trailers let the TUI report which steps actually ran. A step that
+        // exits early never reaches its trailer.
         script.push_str(&format!(
-            r#"
+            "printf 'ran %s\\n' '{}' >> \"$ARCHCTL_STATUS_FILE\"\n",
+            step.name
+        ));
+    }
+
+    let mut script_file = tempfile::NamedTempFile::new()
+        .context("Failed to create a temporary script file")?;
+    std::io::Write::write_all(&mut script_file, script.as_bytes())
+        .context("Failed to write the temporary script")?;
+
+    let status_file = tempfile::NamedTempFile::new()
+        .context("Failed to create a temporary status file")?;
+
+    Ok(Prepared {
+        script: script_file,
+        status: status_file,
+    })
+}
+
+/// Overrides bash's `read` builtin so every prompt in the script is answered
+/// automatically. Reads whose stdin is redirected (the `while read` loops that
+/// parse command output) are passed through to the real builtin, otherwise
+/// they would never see EOF and would loop forever.
+fn auto_confirm_override(confirm: bool) -> String {
+    let answer = if confirm { "y" } else { "n" };
+    let message = if confirm {
+        "auto-confirmed (yes)"
+    } else {
+        "auto-declined (no)"
+    };
+    let return_code = if confirm { 0 } else { 1 };
+
+    format!(
+        r#"
 # --- archctl auto-confirm override ---
 read() {{
-    local prompt=""
-    local var=""
+    if [[ ! -t 0 ]]; then
+        builtin read "$@"
+        return $?
+    fi
+    local prompt="" var="" opt
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -p) prompt="$2"; shift 2 ;;
-            -r|-s|-n|-d|-t) shift ;;
+            --) shift; break ;;
+            -a|-d|-i|-n|-N|-p|-t|-u)
+                opt="$1"; shift
+                if [[ $# -gt 0 ]]; then
+                    [[ "$opt" == "-p" ]] && prompt="$1"
+                    shift
+                fi
+                ;;
+            -*) shift ;;
             *) var="$1"; shift ;;
         esac
     done
@@ -135,82 +241,17 @@ read() {{
     fi
     echo "{ans} [{msg}]"
     if [[ -n "$var" ]]; then
-        printf -v "$var" "{ans}"
+        printf -v "$var" "%s" "{ans}"
     else
         REPLY="{ans}"
     fi
-    return 0
+    return {code}
 }}
 "#,
-            ans = answer,
-            msg = msg,
-        ));
-    }
-
-    // 4. Selected steps
-    for step in selected {
-        script.push_str(&format!("\n# === {} ===\n", step.name));
-        if let Some((start, end)) = get_step_lines(&lines, step.name) {
-            let start_idx = start.saturating_sub(1);
-            let end_idx = end.min(lines.len());
-            if start_idx < end_idx {
-                for line in &lines[start_idx..end_idx] {
-                    script.push_str(line);
-                    script.push('\n');
-                }
-            }
-        }
-    }
-
-    // 5. Write to temp file
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let temp_dir = std::env::temp_dir();
-    let script_path = temp_dir.join(format!("archctl-{}-{}.sh", std::process::id(), timestamp));
-
-    fs::write(&script_path, &script)
-        .with_context(|| format!("Failed to write script to {}", script_path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(&script_path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o755);
-            let _ = fs::set_permissions(&script_path, perms);
-        }
-    }
-
-    Ok(script_path)
-}
-
-/// Run the generated script interactively with standard terminal I/O.
-/// Allows sudo, pacman, yay, and user prompts to display in real-time.
-pub fn run_interactive(script: &Path, auto_confirm: Option<bool>) -> Result<ExitStatus> {
-    let mut cmd = Command::new("bash");
-    cmd.arg(script);
-
-    // If auto_confirm is Some(true), pass --noconfirm for pacman/yay
-    if auto_confirm == Some(true) {
-        cmd.arg("--noconfirm");
-    }
-
-    cmd.stdin(Stdio::inherit());
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
-
-    let status = cmd
-        .status()
-        .with_context(|| format!("Failed to execute script at {}", script.display()))?;
-
-    Ok(status)
-}
-
-/// Clean up the temp script file.
-pub fn cleanup(path: &Path) {
-    let _ = fs::remove_file(path);
+        ans = answer,
+        msg = message,
+        code = return_code,
+    )
 }
 
 #[cfg(test)]
@@ -218,65 +259,99 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn get_update_script_path() -> String {
-        let candidate = Path::new("../update.sh");
-        if candidate.exists() {
-            return candidate.to_string_lossy().into_owned();
-        }
-        let candidate2 = Path::new("update.sh");
-        if candidate2.exists() {
-            return candidate2.to_string_lossy().into_owned();
-        }
-        "../update.sh".to_string()
+    fn update_script() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("update.sh");
+        assert!(path.exists(), "update.sh must exist for the script tests");
+        path.to_string_lossy().into_owned()
     }
 
     #[test]
-    fn test_generate_script_all_steps_syntax() {
-        let update_path = get_update_script_path();
-        if !Path::new(&update_path).exists() {
-            return;
+    fn test_all_steps_produce_a_body() {
+        let path = update_script();
+        for step in Step::all() {
+            let prepared = generate_script(&path, &[&step], None).unwrap();
+            let script = prepared.script_text().unwrap();
+            let header = format!("# === {} ===", step.name);
+            let body = script
+                .split(&header)
+                .nth(1)
+                .unwrap_or_else(|| panic!("step '{}' missing from generated script", step.name));
+            let real_lines = body
+                .lines()
+                .filter(|line| {
+                    let line = line.trim();
+                    !line.is_empty() && !line.starts_with("printf 'ran ")
+                })
+                .count();
+            assert!(
+                real_lines > 0,
+                "step '{}' generated an empty body",
+                step.name
+            );
         }
+    }
 
-        let all_steps = Step::all();
-        let selected: Vec<&Step> = all_steps.iter().collect();
+    #[test]
+    fn test_missing_marker_is_an_error() {
+        let path = update_script();
+        let prepared = generate_script(&path, &[&Step::all()[0]], None).unwrap();
+        let mut broken = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut broken, b"#!/usr/bin/env bash\necho hi\n").unwrap();
+        let result = generate_script(broken.path().to_str().unwrap(), &[&Step::all()[0]], None);
+        assert!(result.is_err(), "a script without markers must be rejected");
+        drop(prepared);
+    }
+
+    #[test]
+    fn test_auto_confirm_override_leaves_piped_reads_alone() {
+        // `while read` loops that parse command output must still see EOF.
+        let mut script = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut script,
+            format!(
+                "{}\nwhile IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done < <(printf 'a\\nb\\n')\n",
+                auto_confirm_override(true)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        let output = Command::new("bash")
+            .arg(script.path())
+            .output()
+            .expect("failed to run bash");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("got:a"), "stdout: {}", stdout);
+        assert!(stdout.contains("got:b"), "stdout: {}", stdout);
+    }
+
+    #[test]
+    fn test_generated_script_is_valid_bash() {
+        let path = update_script();
+        let steps = Step::all();
+        let selected: Vec<&Step> = steps.iter().collect();
 
         for confirm in [None, Some(true), Some(false)] {
-            let script_path = generate_script(&update_path, &selected, confirm).unwrap();
+            let prepared = generate_script(&path, &selected, confirm).unwrap();
             let status = Command::new("bash")
                 .arg("-n")
-                .arg(&script_path)
+                .arg(prepared.script_path())
                 .status()
                 .expect("Failed to run bash -n");
-
-            cleanup(&script_path);
             assert!(status.success(), "Generated script failed bash syntax check");
         }
     }
 
     #[test]
-    fn test_generate_script_individual_steps_syntax() {
-        let update_path = get_update_script_path();
-        if !Path::new(&update_path).exists() {
-            return;
-        }
+    fn test_trailers_are_in_selection_order() {
+        let path = update_script();
+        let steps = Step::all();
+        let selected = vec![&steps[3], &steps[4]];
+        let prepared = generate_script(&path, &selected, None).unwrap();
+        let script = prepared.script_text().unwrap();
 
-        let all_steps = Step::all();
-        for step in &all_steps {
-            let selected = vec![step];
-            let script_path = generate_script(&update_path, &selected, None).unwrap();
-            let status = Command::new("bash")
-                .arg("-n")
-                .arg(&script_path)
-                .status()
-                .expect("Failed to run bash -n");
-
-            cleanup(&script_path);
-            assert!(
-                status.success(),
-                "Step '{}' alone failed bash syntax check",
-                step.name
-            );
-        }
+        let orphans = script.rfind("'Orphaned packages'").unwrap();
+        let cache = script.rfind("'Pacman cache cleanup'").unwrap();
+        assert!(orphans < cache, "trailers must follow the selection order");
     }
 }
-
