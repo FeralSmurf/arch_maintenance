@@ -164,6 +164,8 @@ if [[ -f "$PACMAN_LOG" ]]; then
     LOG_START_LINE=$(wc -l < "$PACMAN_LOG" 2>/dev/null || echo 0)
 fi
 PACMAN_DB_LCK="/var/lib/pacman/db.lck"
+RUNNING_KERNEL=$(uname -r)
+RUNNING_PKGBASE=$(cat "/usr/lib/modules/${RUNNING_KERNEL}/pkgbase" 2>/dev/null || echo "linux")
 "#,
     );
 

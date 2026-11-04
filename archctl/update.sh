@@ -102,14 +102,24 @@ delete_trash() {
         warn "Trash contains ${item_count} item(s) (${trash_size})."
         read -r -p "Delete all items in trash? [y/N]: " clean_trash
         if [[ "${clean_trash:-}" =~ ^[Yy]$ ]]; then
+            local emptied=0
             if command -v gio >/dev/null 2>&1; then
-                gio trash --empty
+                gio trash --empty && emptied=1
             elif command -v trash-empty >/dev/null 2>&1; then
-                trash-empty -f
-            else
-                rm -rf "${trash_dir}/files/"* "${trash_dir}/info/"*
+                trash-empty -f && emptied=1
             fi
-            success "Trash emptied successfully."
+
+            if [[ $emptied -eq 0 ]]; then
+                rm -rf "${trash_dir:?}/files" "${trash_dir:?}/info" && \
+                    mkdir -p "${trash_dir}/files" "${trash_dir}/info" && \
+                    emptied=1
+            fi
+
+            if [[ $emptied -eq 1 ]]; then
+                success "Trash emptied successfully."
+            else
+                warn "Failed to empty trash."
+            fi
         else
             info "Skipped trash cleanup."
         fi
@@ -134,8 +144,8 @@ check_broken_symlinks() {
         -o -path "$search_dir/.steam" \
         -o -path "$search_dir/.wine" \
         -o -path "$search_dir/.var" \
-        -o -path "*/.mozilla/*" \
-        -o -path "*/.thunderbird/*" \) -prune \
+        -o -path "$search_dir/.mozilla" \
+        -o -path "$search_dir/.thunderbird" \) -prune \
         -o -xtype l -print 2>/dev/null || true)
 
     if [[ ${#broken_links[@]} -gt 0 ]]; then
@@ -169,6 +179,12 @@ check_broken_symlinks() {
 # ------------------------------------------------------------------------------
 banner
 
+if [[ $EUID -eq 0 ]]; then
+    error "Do not run this script as root or with sudo."
+    info "Run it as a normal user; sudo will be invoked where needed."
+    exit 1
+fi
+
 # 1. Determine package manager (yay -> paru -> pacman)
 if command -v yay >/dev/null 2>&1; then
     HELPER="yay"
@@ -186,15 +202,29 @@ info "Using package manager: ${B_WHITE}${HELPER}${RESET}"
 PACMAN_DB_LCK="/var/lib/pacman/db.lck"
 if [[ -f "$PACMAN_DB_LCK" ]]; then
     warn "Pacman database lock exists: ${PACMAN_DB_LCK}"
-    if pgrep -x "pacman" >/dev/null 2>&1 || pgrep -x "yay" >/dev/null 2>&1 || pgrep -x "paru" >/dev/null 2>&1; then
-        error "Another package manager process is currently active. Aborting."
+    LOCK_ACTIVE=0
+    if command -v fuser >/dev/null 2>&1; then
+        if sudo fuser "$PACMAN_DB_LCK" >/dev/null 2>&1; then
+            LOCK_ACTIVE=1
+        fi
+    fi
+    if [[ $LOCK_ACTIVE -eq 0 ]] && (pgrep -x "pacman" >/dev/null 2>&1 || pgrep -x "yay" >/dev/null 2>&1 || pgrep -x "paru" >/dev/null 2>&1); then
+        LOCK_ACTIVE=1
+    fi
+
+    if [[ $LOCK_ACTIVE -eq 1 ]]; then
+        error "Another package manager process is currently holding the database lock. Aborting."
         exit 1
     else
         warn "No active package manager detected. The lock may be stale."
         read -r -p "Remove the stale lock file and continue? [y/N]: " rm_lck
         if [[ "${rm_lck:-}" =~ ^[Yy]$ ]]; then
-            sudo rm -f "$PACMAN_DB_LCK"
-            success "Stale lock removed."
+            if sudo rm -f "$PACMAN_DB_LCK"; then
+                success "Stale lock removed."
+            else
+                error "Failed to remove ${PACMAN_DB_LCK}."
+                exit 1
+            fi
         else
             error "Cannot proceed while db.lck is present."
             exit 1
@@ -208,6 +238,11 @@ LOG_START_LINE=0
 if [[ -f "$PACMAN_LOG" ]]; then
     LOG_START_LINE=$(wc -l < "$PACMAN_LOG")
 fi
+
+# 4. Detect running kernel pkgbase before any upgrade replaces module trees
+RUNNING_KERNEL=$(uname -r)
+RUNNING_PKGBASE=$(cat "/usr/lib/modules/${RUNNING_KERNEL}/pkgbase" 2>/dev/null || true)
+[[ -z "$RUNNING_PKGBASE" ]] && RUNNING_PKGBASE="linux"
 
 # ------------------------------------------------------------------------------
 # System Update
@@ -263,8 +298,11 @@ if [[ -n "$ORPHANS" ]]; then
     read -r -p "Remove these orphaned packages? [y/N]: " clean_orphans
     if [[ "${clean_orphans:-}" =~ ^[Yy]$ ]]; then
         # shellcheck disable=SC2086
-        sudo pacman -Rns $ORPHANS
-        success "Orphaned packages removed."
+        if sudo pacman -Rns $ORPHANS; then
+            success "Orphaned packages removed."
+        else
+            warn "Failed to remove some or all orphaned packages."
+        fi
     else
         info "Skipped orphan removal."
     fi
@@ -281,9 +319,14 @@ if command -v paccache >/dev/null 2>&1; then
         info "$CACHE_CANDIDATES"
         read -r -p "Clean package cache (keep last 2 versions)? [y/N]: " clean_cache
         if [[ "${clean_cache:-}" =~ ^[Yy]$ ]]; then
-            sudo paccache -rk2
-            sudo paccache -ruk0
-            success "Pacman cache cleaned."
+            CACHE_FAILED=0
+            sudo paccache -rk2 || CACHE_FAILED=1
+            sudo paccache -ruk0 || CACHE_FAILED=1
+            if [[ $CACHE_FAILED -eq 0 ]]; then
+                success "Pacman cache cleaned."
+            else
+                warn "Pacman cache cleanup finished with warnings/errors."
+            fi
         else
             info "Skipped cache cleanup."
         fi
@@ -339,8 +382,10 @@ fi
 # Check B: Packages that require a reboot, upgraded since the last boot.
 # Kernel packages are matched against the running kernel's pkgbase, so upgrading
 # "linux" while booted into "linux-lts" no longer flags a reboot.
-RUNNING_PKGBASE=$(cat "/usr/lib/modules/${RUNNING_KERNEL}/pkgbase" 2>/dev/null || true)
-[[ -z "$RUNNING_PKGBASE" ]] && RUNNING_PKGBASE="linux"
+if [[ -z "${RUNNING_PKGBASE:-}" ]]; then
+    RUNNING_PKGBASE=$(cat "/usr/lib/modules/${RUNNING_KERNEL}/pkgbase" 2>/dev/null || true)
+    [[ -z "$RUNNING_PKGBASE" ]] && RUNNING_PKGBASE="linux"
+fi
 REBOOT_REGEX="^(${RUNNING_PKGBASE}|systemd|systemd-libs|systemd-sysvcompat|udev|glibc|linux-firmware|amd-ucode|intel-ucode|nvidia|nvidia-dkms|nvidia-open|nvidia-open-dkms|cryptsetup)$"
 
 # Scan since boot so this step works on its own. Fall back to the line offset
@@ -352,15 +397,17 @@ if [[ -n "$BOOT_TIME" ]]; then
 fi
 
 if [[ -f "$PACMAN_LOG" ]]; then
+    CRITICAL_GREP=" (${RUNNING_PKGBASE}|systemd|systemd-libs|systemd-sysvcompat|udev|glibc|linux-firmware|amd-ucode|intel-ucode|nvidia|nvidia-dkms|nvidia-open|nvidia-open-dkms|cryptsetup) "
     if [[ "$BOOT_EPOCH" -gt 0 ]]; then
-        PACMAN_SLICE=$(grep -E '\[ALPM\] (upgraded|installed) ' "$PACMAN_LOG" 2>/dev/null | tail -n 2000 || true)
+        PACMAN_SLICE=$(grep -E '\[ALPM\] (upgraded|installed) ' "$PACMAN_LOG" 2>/dev/null | grep -E "$CRITICAL_GREP" | tail -n 500 || true)
     else
-        PACMAN_SLICE=$(tail -n +"$(( ${LOG_START_LINE:-0} + 1 ))" "$PACMAN_LOG" 2>/dev/null | grep -E '\[ALPM\] (upgraded|installed) ' || true)
+        PACMAN_SLICE=$(tail -n +"$(( ${LOG_START_LINE:-0} + 1 ))" "$PACMAN_LOG" 2>/dev/null | grep -E '\[ALPM\] (upgraded|installed) ' | grep -E "$CRITICAL_GREP" || true)
     fi
 
     if [[ -n "$PACMAN_SLICE" ]]; then
         UPGRADED_CRITICAL=$(
             while IFS= read -r entry; do
+                [[ -z "$entry" ]] && continue
                 pkg=$(sed -E 's/.*\[ALPM\] (upgraded|installed) ([^ ]+) .*/\2/' <<< "$entry")
                 [[ "$pkg" =~ $REBOOT_REGEX ]] || continue
                 if [[ "$BOOT_EPOCH" -gt 0 ]]; then
